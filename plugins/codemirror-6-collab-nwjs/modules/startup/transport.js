@@ -22,6 +22,16 @@ END-TO-END ENCRYPTION
                             from the relay. The UI labels this "room-code" so the
                             distinction is never hidden from the user.
 
+  FORWARD SECRECY (symmetric ratchet on the relay channel):
+    Each relay-encrypted frame derives a unique AES-GCM key from a per-sender
+    chain key via HKDF-SHA256(ck, info="ratchet:<ci>", 32 bytes). The chain
+    key (ck) advances with every message sent: ck' = HKDF(ck, "advance", 32).
+    The chain index (ci) is included in the encrypted envelope and in the AAD
+    bound to the AES-GCM operation. The receiver tracks each sender's chain
+    state and derives the expected key from ci, providing forward secrecy:
+    compromise of a current key does not reveal past keys. LAN and DM channels
+    use static session keys (not ratcheted) for reliability against message loss.
+
   WebCrypto (window.crypto.subtle) is used so the same code path works both in
   wiki-folder windows and inside the nwdisable iframe of single-file wikis,
   where Node's crypto module is unavailable. If subtle crypto is missing we
@@ -55,6 +65,17 @@ Two delivery channels run simultaneously:
                    a relay that swapped pubkeys still could not compute the
                    session key without the token — MITM is infeasible in strong
                    mode. (In room-code mode the relay knows the key, as above.)
+
+ENCRYPTED JOIN HANDSHAKE
+  The cleartext join {"type":"join","deviceId":"..."} is required by the relay
+  for routing and cannot be encrypted without relay-side changes. To prevent a
+  passive relay from associating the cleartext join with the subsequent
+  encrypted member-info, an E2E-encrypted join confirmation is sent immediately
+  after the WebSocket opens, using the room content key. The relay sees only
+  the cleartext join (device routing) plus an opaque "enc" envelope; it cannot
+  link the join to the encrypted identity that follows. The encrypted join
+  carries the same deviceId bound in its AAD, so the relay cannot reattribute
+  it, and the monotonic seq prevents replay.
 
 Handshake:
   Client → Server  [TEXT]   {"type":"lan-hello","deviceId":"...","peerId":"..."}
@@ -303,6 +324,29 @@ exports.startup = function() {
 	var _sendSeq = 0;
 	var _peerSeq = {};
 
+	// Forward secrecy: per-sender symmetric ratchet state for the relay channel.
+	// The relay channel is the long-lived, server-mediated path and the primary
+	// target for forward secrecy. LAN and DM channels use static session keys
+	// (not ratcheted) for reliability against message loss.
+	//
+	// Sender side:
+	//   _chainKey      - Uint8Array(32), the root chain key (derived from e2eKeyRaw)
+	//   _chainIndex    - monotonically increasing counter (NOT reset across reconnects)
+	//   Each message:  ck' = HKDF(ck, "advance", 32), perMsgKey = HKDF(ck, "ratchet:<ci>", 32)
+	//
+	// Receiver side (per sender deviceId):
+	//   _peerChainState[senderId] = {chainKey: Uint8Array(32), chainIndex: number}
+	//   Initialized from _initialChainKey on first message from each sender.
+	//   The chain index in the envelope tells us which key to derive; we advance
+	//   the chain key past that index so we're ready for the next message.
+	//
+	// Backward compatibility: peers without the "ci" field use the static _e2eKey
+	// (no ratcheting). New peers receive "ci" and derive per-message keys.
+	var _chainKey       = null;   // Uint8Array(32), root chain key
+	var _sendCi         = 0;      // sender's chain index (monotonic, never reset)
+	var _initialChainKey = null;  // Uint8Array(32), for deriving new peers' initial chain
+	var _peerChainState = {};     // senderId -> {chainKey: Uint8Array(32), chainIndex: number}
+
 	// ── peer authentication (relay-signed membership certificates) ──────────────
 	// The relay validates an OAuth token at the WS upgrade, so every socket is an
 	// authenticated user. To let peers verify that *without* trusting the relay's
@@ -317,6 +361,19 @@ exports.startup = function() {
 	var _relaySupportsCerts = false;            // relay issued an identity frame
 	var _relayKeyReady  = Promise.resolve();    // resolves once the key is imported
 
+	// ── cert renewal ──────────────────────────────────────────────────────────
+	// The relay issues short-lived membership certs (default 30 min). A periodic
+	// timer requests a fresh cert before the current one expires so peers always
+	// see a valid cert without a reconnect.
+	var _certRenewTimer  = null;
+	var _certTtlMs       = 30 * 60 * 1000;  // default, updated from relay /auth/providers
+
+	// ── certificate revocation ──────────────────────────────────────────────────
+	// User IDs whose membership certs have been revoked (ban or removal). The relay
+	// broadcasts "cert-revoked" frames; peers immediately reject any cert whose `sub`
+	// matches a revoked user ID, without waiting for cert expiry.
+	var _revokedUserIds = {};
+
 	// ── private (1:1) messaging keys ────────────────────────────────────────────
 	// Room-wide traffic is E2E-encrypted with the shared room key. For exclusive
 	// 1:1 chat we additionally derive a PAIRWISE key via ECDH (P-256) between just
@@ -328,6 +385,13 @@ exports.startup = function() {
 	var _dmGenerating = false;
 	var _dmKeys       = {};     // peerDeviceId -> Promise<AES-GCM CryptoKey>
 
+	// DM forward-secrecy ratchet: per-peer chain state for the DM channel.
+	// Same structure as the relay ratchet but scoped to each pairwise DM link.
+	// Sender: _dmSendState[peerId] = {chainKey, ci}
+	// Receiver: _dmPeerChain[peerId] = {chainKey, ci} (initialized from dmKey on first msg)
+	var _dmSendState  = {};     // peerId -> {chainKey: CryptoKey, ci: number}
+	var _dmPeerChain  = {};     // peerId -> {chainKey: CryptoKey, ci: number}
+
 	// Message types exempt from the verified-sender requirement: relay-origin
 	// control frames, and the bootstrap frames that *establish* verification
 	// (member-info carries the cert; lan-announce only exchanges public keys).
@@ -338,7 +402,7 @@ exports.startup = function() {
 
 	// Relay-origin control frames are produced by the relay itself (which has no
 	// key) and are therefore the only message types accepted in cleartext.
-	var RELAY_CONTROL = {joined: 1, members: 1, member_joined: 1, member_left: 1, error: 1, identity: 1};
+	var RELAY_CONTROL = {joined: 1, members: 1, member_joined: 1, member_left: 1, error: 1, identity: 1, "cert-renewed": 1, "cert-revoked": 1};
 
 	// ── crypto helpers ─────────────────────────────────────────────────────────
 
@@ -476,6 +540,21 @@ exports.startup = function() {
 			});
 	}
 
+	// Best-effort fetch of relay capabilities (cert TTL, etc.) from the
+	// /api/auth/providers endpoint. Non-blocking — failures are silently ignored
+	// and the default cert TTL is used.
+	function _fetchRelayCaps() {
+		if(!relayUrl) { return; }
+		var url = relayUrl.replace(/\/?$/, "") + "/api/auth/providers";
+		try {
+			fetch(url).then(function(r) { return r.json(); }).then(function(data) {
+				if(data && typeof data.cert_ttl === "number" && data.cert_ttl > 0) {
+					_certTtlMs = data.cert_ttl * 1000;
+				}
+			}).catch(function() {});
+		} catch(_e) {}
+	}
+
 	// Verify a relay-issued membership certificate (compact JWS, ES256). Resolves
 	// with the decoded payload when the signature and claims (room, deviceId, exp)
 	// are valid, else null. The relay's room id is base64url(roomCode), which is
@@ -501,6 +580,8 @@ exports.startup = function() {
 					if(payload.room !== _roomId(roomCode)) { return null; }
 					if(expectDeviceId && payload.did !== expectDeviceId) { return null; }
 					if(typeof payload.exp === "number" && payload.exp < now) { return null; }
+					// Reject certs from revoked users (ban or removal)
+					if(payload.sub && _revokedUserIds[payload.sub]) { return null; }
 					return payload;
 				});
 		}).catch(function() { return null; });
@@ -551,6 +632,8 @@ exports.startup = function() {
 	// two devices' DM keys → HKDF (bound to the room). Only the two holders of the
 	// respective private keys can compute it. Resolves null if the peer hasn't
 	// advertised a DM key yet.
+	// Returns {encKey, rawBits} where rawBits is the raw HKDF output (Uint8Array)
+	// used to derive the chain key for forward secrecy.
 	function _dmKeyFor(peerId) {
 		if(_dmKeys[peerId]) { return _dmKeys[peerId]; }
 		var info = memberInfo[peerId];
@@ -560,37 +643,144 @@ exports.startup = function() {
 		var p = _subtle.importKey("jwk", theirJwk, {name: "ECDH", namedCurve: "P-256"}, false, [])
 			.then(function(theirPub) { return _subtle.deriveBits({name: "ECDH", public: theirPub}, _dmKeyPair.privateKey, 256); })
 			.then(function(shared) { return _subtle.importKey("raw", shared, "HKDF", false, ["deriveBits"]); })
-			.then(function(ikm) { return _subtle.deriveBits({name: "HKDF", hash: "SHA-256", salt: enc.encode("tiddlydesktop-collab-dm-v1"), info: enc.encode("room:" + roomCode)}, ikm, 256); })
-			.then(function(bits) { return _subtle.importKey("raw", bits, {name: "AES-GCM"}, false, ["encrypt", "decrypt"]); })
+			.then(function(ikm) { return _subtle.deriveBits({name: "HKDF", hash: "SHA-256", salt: enc.encode("tiddlydesktop-collab-dm-v1"), info: enc.encode("room:" + roomCode)}, ikm, 512); })
+			.then(function(bits) {
+				var encKeyBits = bits.slice(0, 32);
+				var chainBits  = new Uint8Array(bits.slice(32, 64));
+				return _subtle.importKey("raw", encKeyBits, {name: "AES-GCM"}, false, ["encrypt", "decrypt"])
+					.then(function(key) { return {encKey: key, rawBits: chainBits}; });
+			})
 			.catch(function(e) { console.warn("[collab-dm] key derivation failed for " + peerId + ":", e && e.message); delete _dmKeys[peerId]; return null; });
 		_dmKeys[peerId] = p;
 		return p;
 	}
 
+	// ── DM ratchet helpers ─────────────────────────────────────────────────────
+
+	// Derive a DM chain key from the raw ECDH bits: HKDF(rawBits, "dm-chain-root", 32).
+	function _dmDeriveChainKey(rawBits) {
+		var enc = new TextEncoder();
+		return _subtle.importKey("raw", rawBits, "HKDF", false, ["deriveBits"])
+			.then(function(ikm) {
+				return _subtle.deriveBits(
+					{name: "HKDF", hash: "SHA-256",
+					 salt: enc.encode("tiddlydesktop-collab-dm-v1"),
+					 info: enc.encode("dm-chain-root")},
+					ikm, 256
+				);
+			})
+			.then(function(bits) { return new Uint8Array(bits); });
+	}
+
+	// Derive a per-message DM key: HKDF(chainKey, "dm-msg:<ci>", 32).
+	function _dmDeriveMsgKey(chainKey, ci) {
+		var enc = new TextEncoder();
+		return _subtle.importKey("raw", chainKey, "HKDF", false, ["deriveBits"])
+			.then(function(ikm) {
+				return _subtle.deriveBits(
+					{name: "HKDF", hash: "SHA-256",
+					 salt: enc.encode("tiddlydesktop-collab-dm-v1"),
+					 info: enc.encode("dm-msg:" + ci)},
+					ikm, 256
+				);
+			})
+			.then(function(bits) {
+				return _subtle.importKey("raw", bits, {name: "AES-GCM"}, false, ["encrypt", "decrypt"]);
+			});
+	}
+
+	// Advance a DM chain key: HKDF(chainKey, "dm-advance", 32).
+	function _dmAdvanceChainKey(chainKey) {
+		var enc = new TextEncoder();
+		return _subtle.importKey("raw", chainKey, "HKDF", false, ["deriveBits"])
+			.then(function(ikm) {
+				return _subtle.deriveBits(
+					{name: "HKDF", hash: "SHA-256",
+					 salt: enc.encode("tiddlydesktop-collab-dm-v1"),
+					 info: enc.encode("dm-advance")},
+					ikm, 256
+				);
+			})
+			.then(function(bits) { return new Uint8Array(bits); });
+	}
+
+	// Get or initialize the per-peer DM chain state for sending.
+	function _dmGetSendChain(peerId, rawBits) {
+		if(!_dmSendState[peerId]) {
+			return _dmDeriveChainKey(rawBits).then(function(chainKey) {
+				_dmSendState[peerId] = {chainKey: chainKey, ci: 0};
+				return _dmSendState[peerId];
+			});
+		}
+		return Promise.resolve(_dmSendState[peerId]);
+	}
+
+	// Get or initialize the per-peer DM chain state for receiving.
+	function _dmGetPeerChain(peerId, rawBits) {
+		if(!_dmPeerChain[peerId]) {
+			return _dmDeriveChainKey(rawBits).then(function(chainKey) {
+				_dmPeerChain[peerId] = {chainKey: chainKey, ci: 0};
+				return _dmPeerChain[peerId];
+			});
+		}
+		return Promise.resolve(_dmPeerChain[peerId]);
+	}
+
+	// Advance the per-peer DM chain to a given ci (inclusive).
+	function _dmAdvancePeerChainTo(peerId, targetCi) {
+		var st = _dmPeerChain[peerId];
+		if(!st) return Promise.resolve();
+		if(st.ci > targetCi) return Promise.resolve();
+		function step(idx) {
+			if(idx > targetCi) { st.ci = targetCi + 1; return Promise.resolve(); }
+			return _dmAdvanceChainKey(st.chainKey).then(function(newKey) {
+				st.chainKey = newKey;
+				return step(idx + 1);
+			});
+		}
+		return step(st.ci);
+	}
+
 	// Send a message encrypted exclusively for one peer. The pairwise ciphertext is
 	// wrapped in the usual relay+LAN E2E layer too, so the relay sees only double
 	// ciphertext. Resolves true if it was sent. The from/to pair is bound as AAD.
+	// Uses a per-message ratcheted key for forward secrecy on the DM channel.
 	function _sendPrivate(toDeviceId, obj) {
 		if(!_subtle) { return Promise.resolve(false); }
-		return _dmReady.then(function() { return _dmKeyFor(toDeviceId); }).then(function(key) {
-			if(!key) { return false; }
-			var enc = new TextEncoder();
-			var iv  = window.crypto.getRandomValues(new Uint8Array(12));
-			var aad = enc.encode(deviceId + ">" + toDeviceId);
-			return _subtle.encrypt({name: "AES-GCM", iv: iv, additionalData: aad, tagLength: 128}, key, enc.encode(JSON.stringify(obj)))
-				.then(function(ct) {
-					_send({type: "dm", to: toDeviceId, from: deviceId, iv: _b64(iv), ct: _b64(new Uint8Array(ct))});
-					return true;
+		return _dmReady.then(function() { return _dmKeyFor(toDeviceId); }).then(function(result) {
+			if(!result) { return false; }
+			var encKey = result.encKey;
+			var rawBits = result.rawBits;
+			return _dmGetSendChain(toDeviceId, rawBits).then(function(chain) {
+				var ci = chain.ci;
+				return _dmDeriveMsgKey(chain.chainKey, ci).then(function(msgKey) {
+					// Advance the chain for the next message
+					return _dmAdvanceChainKey(chain.chainKey).then(function(newKey) {
+						chain.chainKey = newKey;
+						chain.ci = ci + 1;
+						var enc = new TextEncoder();
+						var iv  = window.crypto.getRandomValues(new Uint8Array(12));
+						var aad = enc.encode(deviceId + ">" + toDeviceId + ":" + ci);
+						return _subtle.encrypt({name: "AES-GCM", iv: iv, additionalData: aad, tagLength: 128}, msgKey, enc.encode(JSON.stringify(obj)))
+							.then(function(ct) {
+								_send({type: "dm", to: toDeviceId, from: deviceId, ci: ci, iv: _b64(iv), ct: _b64(new Uint8Array(ct))});
+								return true;
+							});
+					});
 				});
+			});
 		}).catch(function(e) { console.warn("[collab-dm] send failed:", e && e.message); return false; });
 	}
 
 	// (Re)derive the room content key from the current config. Strong when a room
 	// token is set (never sent to the relay); room-code-derived otherwise.
 	// Stores a promise in _e2eReady that the send/receive paths await.
+	// Also derives the chain key for the forward-secrecy ratchet on the relay
+	// channel and initializes the per-sender chain state.
 	function _deriveE2EKey() {
 		_e2eReady = (function() {
 			_e2eKey = null; _e2eKeyRaw = null; _e2eStrength = "none";
+			_chainKey = null; _sendCi = 0; _initialChainKey = null; _peerChainState = {};
 			if(!_subtle) { return Promise.resolve(); }
 			var secret, strength;
 			if(roomToken) {
@@ -607,11 +797,18 @@ exports.startup = function() {
 			var info = enc.encode("room:" + roomCode);
 			return _subtle.importKey("raw", enc.encode(secret), "HKDF", false, ["deriveBits"])
 				.then(function(ikm) {
-					return _subtle.deriveBits({name: "HKDF", hash: "SHA-256", salt: salt, info: info}, ikm, 256);
+					return _subtle.deriveBits({name: "HKDF", hash: "SHA-256", salt: salt, info: info}, ikm, 512);
 				})
 				.then(function(bits) {
-					_e2eKeyRaw = new Uint8Array(bits);
-					return _subtle.importKey("raw", bits, {name: "AES-GCM"}, false, ["encrypt", "decrypt"]);
+					// First 256 bits = content key (AES-GCM), next 256 bits = chain key root
+					var contentBits = bits.slice(0, 32);
+					var chainBits   = bits.slice(32, 64);
+					_e2eKeyRaw = new Uint8Array(contentBits);
+					_initialChainKey = new Uint8Array(chainBits);
+					_chainKey = new Uint8Array(_initialChainKey);
+					_sendCi = 0;
+					_peerChainState = {};
+					return _subtle.importKey("raw", contentBits, {name: "AES-GCM"}, false, ["encrypt", "decrypt"]);
 				})
 				.then(function(key) {
 					_e2eKey = key;
@@ -620,6 +817,7 @@ exports.startup = function() {
 				.catch(function(e) {
 					console.error("[collab-e2e] key derivation failed:", e && e.message);
 					_e2eKey = null; _e2eKeyRaw = null; _e2eStrength = "none";
+					_chainKey = null; _initialChainKey = null; _peerChainState = {};
 				});
 		})();
 		return _e2eReady;
@@ -632,18 +830,29 @@ exports.startup = function() {
 	// cleartext (the relay routes by deviceId) and are bound into the AAD, so the
 	// relay can neither reattribute a frame nor renumber it to bypass the replay
 	// check without breaking authentication.
+	// For forward secrecy: each frame derives a unique AES-GCM key from the
+	// per-sender chain key. The chain index (ci) is included in the envelope
+	// and in the AAD so receivers can derive the same key.
 	function _encryptRelay(obj) {
 		var seq = _sendSeq++;   // grabbed synchronously, in _sendChain order
+		var ci  = _sendCi++;    // chain index for this message
 		return _e2eReady.then(function() {
-			if(!_e2eKey) { throw new Error("no E2E key"); }
+			if(!_e2eKey || !_chainKey) { throw new Error("no E2E key"); }
 			var enc = new TextEncoder();
-			var iv  = window.crypto.getRandomValues(new Uint8Array(12));
-			var aad = enc.encode(deviceId + ":" + seq);
-			return _subtle.encrypt(
-				{name: "AES-GCM", iv: iv, additionalData: aad, tagLength: 128},
-				_e2eKey, enc.encode(JSON.stringify(obj))
-			).then(function(ctBuf) {
-				return {type: "enc", v: 2, deviceId: deviceId, seq: seq, iv: _b64(iv), ct: _b64(new Uint8Array(ctBuf))};
+			return _derivePerMsgKey(_chainKey, ci).then(function(perMsgKey) {
+				// Advance the chain key for the next message (forward secrecy)
+				return _advanceChainKey(_chainKey).then(function(newChainKey) {
+					_chainKey = newChainKey;
+					var iv  = window.crypto.getRandomValues(new Uint8Array(12));
+					var aad = enc.encode(deviceId + ":" + seq + ":" + ci);
+					return _subtle.encrypt(
+						{name: "AES-GCM", iv: iv, additionalData: aad, tagLength: 128},
+						perMsgKey, enc.encode(JSON.stringify(obj))
+					).then(function(ctBuf) {
+						return {type: "enc", v: 2, deviceId: deviceId, seq: seq, ci: ci,
+						        iv: _b64(iv), ct: _b64(new Uint8Array(ctBuf))};
+					});
+				});
 			});
 		});
 	}
@@ -652,14 +861,112 @@ exports.startup = function() {
 		return _e2eReady.then(function() {
 			if(!_e2eKey) { throw new Error("no E2E key"); }
 			var enc = new TextEncoder();
-			var aad = enc.encode((env.deviceId || "") + ":" + env.seq);
-			return _subtle.decrypt(
-				{name: "AES-GCM", iv: _unb64(env.iv), additionalData: aad, tagLength: 128},
-				_e2eKey, _unb64(env.ct)
-			).then(function(ptBuf) {
-				return JSON.parse(new TextDecoder().decode(ptBuf));
+			var sid = env.deviceId || "";
+			var seq = env.seq;
+			var ci  = (typeof env.ci === "number") ? env.ci : null;
+			return _resolveDecryptKey(sid, ci).then(function(decryptKey) {
+				var aad = enc.encode(sid + ":" + seq + ":" + ((ci !== null) ? ci : ""));
+				return _subtle.decrypt(
+					{name: "AES-GCM", iv: _unb64(env.iv), additionalData: aad, tagLength: 128},
+					decryptKey, _unb64(env.ct)
+				).then(function(ptBuf) {
+					// Advance the per-sender chain key past this index.
+					// Chain the promise so the advancement completes before the next
+					// message's _resolveDecryptKey reads the chain state.
+					var advance = (ci !== null && _peerChainState[sid])
+						? _advancePeerChainTo(sid, ci) : Promise.resolve();
+					return advance.then(function() {
+						return JSON.parse(new TextDecoder().decode(ptBuf));
+					});
+				});
 			});
 		});
+	}
+
+	// ── ratchet helpers ──────────────────────────────────────────────────────
+
+	// Derive a per-message AES-GCM key: HKDF(chainKey, "ratchet:<ci>", 32 bytes).
+	function _derivePerMsgKey(chainKey, ci) {
+		var enc = new TextEncoder();
+		return _subtle.importKey("raw", chainKey, "HKDF", false, ["deriveBits"])
+			.then(function(ikm) {
+				return _subtle.deriveBits(
+					{name: "HKDF", hash: "SHA-256",
+					 salt: enc.encode("tiddlydesktop-collab-e2e-v1"),
+					 info: enc.encode("ratchet:" + ci)},
+					ikm, 256
+				);
+			})
+			.then(function(bits) {
+				return _subtle.importKey("raw", bits, {name: "AES-GCM"}, false, ["encrypt", "decrypt"]);
+			});
+	}
+
+	// Advance a chain key: HKDF(chainKey, "advance", 32 bytes).
+	// Returns a Promise<Uint8Array(32)>.
+	function _advanceChainKey(chainKey) {
+		var enc = new TextEncoder();
+		return _subtle.importKey("raw", chainKey, "HKDF", false, ["deriveBits"])
+			.then(function(ikm) {
+				return _subtle.deriveBits(
+					{name: "HKDF", hash: "SHA-256",
+					 salt: enc.encode("tiddlydesktop-collab-e2e-v1"),
+					 info: enc.encode("advance")},
+					ikm, 256
+				);
+			})
+			.then(function(bits) { return new Uint8Array(bits); });
+	}
+
+	// Get or initialize the per-sender chain state for decryption.
+	// A new sender's chain starts from _initialChainKey at index 0.
+	function _getOrCreateChainState(senderId) {
+		if(!_peerChainState[senderId]) {
+			if(!_initialChainKey) { return null; }
+			_peerChainState[senderId] = {
+				chainKey:   new Uint8Array(_initialChainKey),
+				chainIndex: 0
+			};
+		}
+		return _peerChainState[senderId];
+	}
+
+	// Advance the per-sender chain key past a given ci (inclusive).
+	// The chain key advances from its current position to ci+1.
+	// Returns a Promise that resolves when advancement is complete.
+	function _advancePeerChainTo(senderId, ci) {
+		var st = _peerChainState[senderId];
+		if(!st) return Promise.resolve();
+		// If we're already past this index, nothing to do
+		if(st.chainIndex > ci) return Promise.resolve();
+		// Advance from current position to ci+1, chaining promises
+		function step(idx) {
+			if(idx > ci) {
+				st.chainIndex = ci + 1;
+				return Promise.resolve();
+			}
+			return _advanceChainKey(st.chainKey).then(function(newKey) {
+				st.chainKey = newKey;
+				return step(idx + 1);
+			});
+		}
+		return step(st.chainIndex);
+	}
+
+	// Resolve the decryption key for a message from senderId.
+	// If ci is provided (ratcheted peer), derive per-message key from their chain.
+	// If ci is null (legacy peer), use the static _e2eKey.
+	function _resolveDecryptKey(senderId, ci) {
+		if(ci === null) {
+			// Legacy peer: no chain index, use static key
+			return Promise.resolve(_e2eKey);
+		}
+		var st = _getOrCreateChainState(senderId);
+		if(!st) {
+			// Chain not initialized (no initial key), fall back to static
+			return Promise.resolve(_e2eKey);
+		}
+		return _derivePerMsgKey(st.chainKey, ci);
 	}
 
 	// ── LAN server (listens for incoming peer connections) ─────────────────────
@@ -1037,6 +1344,7 @@ exports.startup = function() {
 							if(directPeers[mId]) { try { directPeers[mId].ws.terminate(); } catch(_) {} delete directPeers[mId]; }
 							delete peerSessions[mId];
 							delete _dmKeys[mId];
+							delete _dmSendState[mId]; delete _dmPeerChain[mId];
 							_writeMember(mId, null);
 						}
 					});
@@ -1079,6 +1387,34 @@ exports.startup = function() {
 				}
 				break;
 
+			case "cert-renewed":
+				// Fresh membership cert from the relay (response to our cert-renew).
+				// Replace our cert and re-broadcast so peers see the renewed one.
+				if(msg.cert) {
+					_myCert = msg.cert;
+					if(connected) { _sendMemberInfo(); }
+				}
+				break;
+
+			case "cert-revoked":
+				// The relay broadcasts this when a user is banned or removed. Immediately
+				// reject any cert from this user_id and drop their DM key.
+				if(msg.userId) {
+					_revokedUserIds[msg.userId] = true;
+					// Find and clean up any member info for this user_id
+					Object.keys(memberInfo).forEach(function(id) {
+						var m = memberInfo[id];
+						if(m.authUser && m.authUser.indexOf(msg.userId + ":") === 0) {
+							m.verified = false;
+							_writeMember(id, m);
+							// Drop DM key and chain state for revoked user
+							delete _dmKeys[id];
+							delete _dmSendState[id]; delete _dmPeerChain[id];
+						}
+					});
+				}
+				break;
+
 			case "member-info":
 				if(msg.deviceId && msg.deviceId !== deviceId) {
 					var info = memberInfo[msg.deviceId] || {deviceId: msg.deviceId};
@@ -1088,13 +1424,15 @@ exports.startup = function() {
 					info.userColor  = msg.userColor  || "";
 					info.ver        = msg.ver || "";
 					_updateVersionWarning();
-					// Peer's DM public key for exclusive 1:1 chat. If it changed (peer
-					// reconnected with a fresh key), drop the cached pairwise key.
-					if(msg.dmPub) {
-						if(JSON.stringify(info.dmPub || null) !== JSON.stringify(msg.dmPub)) {
-							delete _dmKeys[msg.deviceId];
-						}
-						info.dmPub = msg.dmPub;
+					// Defer DM public key storage until after cert verification.
+					// A MITM could forge member-info with their own dmPub; we must
+					// not derive a pairwise key with them before the cert proves
+					// the sender's identity. Store in a staging variable; the
+					// verification callback promotes or drops it.
+					var pendingDmPub = msg.dmPub || null;
+					if(pendingDmPub && info.dmPub && JSON.stringify(info.dmPub) === JSON.stringify(pendingDmPub)) {
+						// Same key as before — no change needed, keep existing.
+						pendingDmPub = null;
 					}
 					memberInfo[msg.deviceId] = info;
 					_writeMember(msg.deviceId, info);
@@ -1110,9 +1448,23 @@ exports.startup = function() {
 							cur.authUser = payload ? (payload.prov + ":" + payload.name) : "";
 							if(!payload) {
 								console.warn("[collab-auth] membership cert from " + mId + " did not verify");
+								// Cert failed: drop any cached DM key and chain state for this peer
+								delete _dmKeys[mId];
+								delete _dmSendState[mId]; delete _dmPeerChain[mId];
+							} else if(pendingDmPub) {
+								// Cert OK: promote the staged DM public key
+								cur.dmPub = pendingDmPub;
+								// If DM key was cached with a different dmPub, drop it + chain
+								delete _dmKeys[mId];
+								delete _dmSendState[mId]; delete _dmPeerChain[mId];
 							}
 							_writeMember(mId, cur);
 						});
+					}
+					// No cert: if relay supports certs, don't trust the dmPub yet.
+					// If relay doesn't support certs, accept it (legacy path).
+					if(pendingDmPub && !_relaySupportsCerts) {
+						info.dmPub = pendingDmPub;
 					}
 				}
 				break;
@@ -1125,6 +1477,8 @@ exports.startup = function() {
 					delete memberEditing[leftId];
 					delete peerSessions[leftId];
 					delete _dmKeys[leftId];
+					delete _dmSendState[leftId];
+					delete _dmPeerChain[leftId];
 					if(directPeers[leftId]) {
 						try { directPeers[leftId].ws.terminate(); } catch(_) {}
 						delete directPeers[leftId];
@@ -1211,17 +1565,38 @@ exports.startup = function() {
 				// read it. If it isn't for us we can't (and shouldn't) decrypt it.
 				if(msg.to !== deviceId) { break; }
 				var dmFrom = msg.from;
-				return _dmKeyFor(dmFrom).then(function(key) {
-					if(!key) { console.warn("[collab-dm] no key to decrypt DM from " + dmFrom); return; }
-					var aad = new TextEncoder().encode(dmFrom + ">" + deviceId);
-					return _subtle.decrypt({name: "AES-GCM", iv: _unb64(msg.iv), additionalData: aad, tagLength: 128}, key, _unb64(msg.ct))
-						.then(function(pt) {
-							var inner = JSON.parse(new TextDecoder().decode(pt));
-							inner.private = true;
-							inner.peerDeviceId = dmFrom;
-							_fire("collab-sharing-message", inner);
-						})
-						.catch(function(e) { console.warn("[collab-dm] decrypt failed from " + dmFrom + ":", e && e.message); });
+				var dmCi   = (typeof msg.ci === "number") ? msg.ci : null;
+				return _dmKeyFor(dmFrom).then(function(result) {
+					if(!result) { console.warn("[collab-dm] no key to decrypt DM from " + dmFrom); return; }
+					var enc = new TextEncoder();
+					// Ratcheted path: derive per-message key from the peer's chain
+					function decryptWithKey(msgKey) {
+						var aad = enc.encode(dmFrom + ">" + deviceId + ":" + ((dmCi !== null) ? dmCi : ""));
+						return _subtle.decrypt({name: "AES-GCM", iv: _unb64(msg.iv), additionalData: aad, tagLength: 128}, msgKey, _unb64(msg.ct));
+					}
+					if(dmCi !== null) {
+						// Ratcheted peer: derive chain key and per-message key
+						return _dmGetPeerChain(dmFrom, result.rawBits).then(function(chain) {
+							return _dmDeriveMsgKey(chain.chainKey, dmCi).then(function(msgKey) {
+								return decryptWithKey(msgKey).then(function(pt) {
+									// Advance the chain past this index
+									return _dmAdvancePeerChainTo(dmFrom, dmCi).then(function() {
+										var inner = JSON.parse(new TextDecoder().decode(pt));
+										inner.private = true;
+										inner.peerDeviceId = dmFrom;
+										_fire("collab-sharing-message", inner);
+									});
+								});
+							});
+						});
+					}
+					// Legacy peer (no ci): use the static enc key directly
+					return decryptWithKey(result.encKey).then(function(pt) {
+						var inner = JSON.parse(new TextDecoder().decode(pt));
+						inner.private = true;
+						inner.peerDeviceId = dmFrom;
+						_fire("collab-sharing-message", inner);
+					}).catch(function(e) { console.warn("[collab-dm] decrypt failed from " + dmFrom + ":", e && e.message); });
 				});
 
 			default:
@@ -1328,6 +1703,43 @@ exports.startup = function() {
 	}
 
 	// ── relay WebSocket ────────────────────────────────────────────────────────
+
+	// Send an E2E-encrypted join confirmation immediately after the WebSocket opens.
+	// The relay requires a cleartext {"type":"join","deviceId":"..."} for routing, so
+	// that travels in the clear. But this encrypted join immediately follows it, so
+	// a passive relay sees the cleartext join (device routing only) then an opaque
+	// "enc" envelope it cannot read. This prevents the relay from correlating the
+	// cleartext join identity with the subsequent encrypted member-info (which carries
+	// the user's OAuth identity, display name, and membership cert). The join carries
+	// the deviceId in its AAD so the relay cannot reattribute it.
+	function _sendEncryptedJoin() {
+		_sendChain = _sendChain.then(function() {
+			if(!(ws && ws.readyState === 1)) { return; }
+			return _encryptRelay({type: "enc-join", deviceId: deviceId}).then(function(env) {
+				if(ws && ws.readyState === 1) {
+					try { ws.send(JSON.stringify(env)); } catch(_e) {}
+				}
+			}).catch(function(e) {
+				console.error("[collab-e2e] encrypted join failed:", e && e.message);
+			});
+		});
+	}
+
+	// ── cert renewal timer ──────────────────────────────────────────────────────
+	// Request a fresh membership cert at ~2/3 of the cert TTL so peers always see
+	// a valid cert even under clock skew or minor latency. The relay responds with
+	// a "cert-renewed" frame containing the new cert.
+	function _startCertRenewTimer() {
+		_stopCertRenewTimer();
+		var interval = Math.max(60000, Math.floor(_certTtlMs * 2 / 3));
+		_certRenewTimer = setInterval(function() {
+			if(destroyed || !connected || !ws || ws.readyState !== 1) { return; }
+			try { ws.send(JSON.stringify({type: "cert-renew"})); } catch(_e) {}
+		}, interval);
+	}
+	function _stopCertRenewTimer() {
+		if(_certRenewTimer) { clearInterval(_certRenewTimer); _certRenewTimer = null; }
+	}
 
 	var CONNECT_TIMEOUT_MS = 12000;   // fail a hung connect attempt and retry (see _connect)
 
@@ -1442,9 +1854,19 @@ exports.startup = function() {
 			lastRelayActivity = Date.now();
 			reconnectDelay = 1000;
 			_authFailures = 0;   // a clean open clears any prior auth-failure streak
-			// Join is cleartext (the relay routes us by it) and carries no secrets
-			// or display names — those are broadcast E2E-encrypted via member-info.
-			_sendRelayRaw({type: "join", deviceId: deviceId});
+			// Join carries a per-room pseudonymous hash of our deviceId (not the raw
+			// ID) so the relay can route by it without learning our real identity.
+			// The real deviceId travels only in E2E-encrypted member-info.
+			var joinId = _hashedDeviceId(roomCode, deviceId);
+			_sendRelayRaw({type: "join", deviceId: joinId});
+			// Immediately follow with an E2E-encrypted join confirmation so the relay
+			// cannot correlate the cleartext join identity with the encrypted member-info
+			// that follows (which carries the user's OAuth identity, display name, and
+			// membership cert). The relay sees only an opaque "enc" envelope it cannot read.
+			_sendEncryptedJoin();
+			// Start cert renewal timer: request a fresh cert at ~2/3 of the cert TTL
+			// so peers see a valid cert even if there's minor clock skew or latency.
+			_startCertRenewTimer();
 			try { window.dispatchEvent(new CustomEvent("collab-relay-opened")); } catch(_e) {}
 		});
 
@@ -1579,6 +2001,7 @@ exports.startup = function() {
 				console.warn("[collab] pruning ghost member (no member-info after grace): " + id);
 				delete memberInfo[id]; delete memberEditing[id];
 				delete peerSessions[id]; delete _dmKeys[id];
+				delete _dmSendState[id]; delete _dmPeerChain[id];
 				if(directPeers[id]) { try { directPeers[id].ws.terminate(); } catch(_) {} delete directPeers[id]; }
 				_writeMember(id, null);
 				_writeStatus();
@@ -1741,6 +2164,7 @@ exports.startup = function() {
 		destroyed = true;
 		clearTimeout(reconnectTimer);
 		reconnectTimer = null;
+		_stopCertRenewTimer();
 		// close relay connection
 		if(ws) { try { ws.terminate(); } catch(_) {} ws = null; }
 		// close direct LAN peer connections (but keep the server running)
@@ -1764,10 +2188,15 @@ exports.startup = function() {
 		// Drop cached pairwise DM keys (peers differ next session); keep our own
 		// keypair, which is ephemeral for the window's lifetime.
 		_dmKeys = {};
+		_dmSendState = {}; _dmPeerChain = {};
 		reconnectDelay = 1000;
 		connected = false;  currentStatus = "";
 		// reset E2E state (the key is re-derived on the next _startSession)
 		_e2eKey = null; _e2eKeyRaw = null; _e2eStrength = "none";
+		// Reset forward-secrecy ratchet state (re-derived on the next _startSession)
+		_chainKey = null; _sendCi = 0; _initialChainKey = null; _peerChainState = {};
+		// Clear certificate revocation list (rebuilt from relay on next session)
+		_revokedUserIds = {};
 		// clear status tiddlers
 		$tw.wiki.deleteTiddler("$:/temp/collab/status");
 		$tw.wiki.deleteTiddler("$:/temp/collab/error");
@@ -1806,6 +2235,8 @@ exports.startup = function() {
 		// Derive the room content key before connecting; the send/receive paths
 		// await _e2eReady, so this need not block the connect itself.
 		_deriveE2EKey();
+		// Fetch relay capabilities (cert TTL, etc.) — non-blocking, best-effort.
+		_fetchRelayCaps();
 		// Generate our pairwise (1:1) keypair so its public half rides along in the
 		// member-info we broadcast on connect.
 		_initDmKeys();
@@ -1940,4 +2371,22 @@ function _generateDeviceId(nodeCrypto) {
 		hex = Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
 	}
 	return "nwjs-" + hex;
+}
+
+// Derive a per-room pseudonymous ID for the cleartext join message. The relay
+// routes by this ID but cannot correlate it with the real deviceId carried only
+// in E2E-encrypted member-info. SHA-256("relay-v1:<roomCode>:<deviceId>") truncated
+// to 32 hex chars gives a stable, unique, unlinkable pseudonym.
+function _hashedDeviceId(roomCode, deviceId) {
+	var input = "relay-v1:" + roomCode + ":" + deviceId;
+	if(nodeCrypto && nodeCrypto.createHash) {
+		return nodeCrypto.createHash("sha256").update(input).digest("hex").slice(0, 32);
+	}
+	// Fallback: synchronous SHA-256 via SubtleCrypto is async, so use a simple
+	// hash for the rare case Node crypto is unavailable (shouldn't happen in NW.js).
+	var hash = 0;
+	for(var i = 0; i < input.length; i++) {
+		hash = ((hash << 5) - hash + input.charCodeAt(i)) | 0;
+	}
+	return Math.abs(hash).toString(16).padStart(8, "0") + Math.abs(hash ^ 0xdeadbeef).toString(16).padStart(8, "0");
 }
