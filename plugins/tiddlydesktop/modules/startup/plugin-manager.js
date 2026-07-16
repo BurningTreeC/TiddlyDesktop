@@ -556,9 +556,15 @@ function _getInstalledFromFolder(folderPath, fs, path) {
 	try {
 		var info = JSON.parse(fs.readFileSync(infoPath, "utf8"));
 		var titles = [];
-		(info.plugins   || []).forEach(function(p) { titles.push("$:/plugins/" + p); });
-		(info.themes    || []).forEach(function(t) { titles.push("$:/themes/" + t); });
-		(info.languages || []).forEach(function(l) { titles.push("$:/languages/" + l); });
+
+		// Build a name→title lookup from the available library so we use the
+		// plugin.info title instead of deriving one from the directory path.
+		var nameToTitle = Object.create(null);
+		available.forEach(function(item) { nameToTitle[item.name] = item.title; });
+
+		(info.plugins   || []).forEach(function(p) { titles.push(nameToTitle[p] || ("$:/plugins/" + p)); });
+		(info.themes    || []).forEach(function(t) { titles.push(nameToTitle[t] || ("$:/themes/" + t)); });
+		(info.languages || []).forEach(function(l) { titles.push(nameToTitle[l] || ("$:/languages/" + l)); });
 		return titles;
 	} catch(_e) {
 		return [];
